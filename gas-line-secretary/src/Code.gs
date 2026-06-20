@@ -78,14 +78,38 @@ function handleLineEvent(event) {
 
 function handleTextMessage(event) {
   const text = (event.message.text || '').trim();
+  const selfServiceCommand = parseSelfServiceCommand(text);
+
+  if (selfServiceCommand) {
+    handleSelfServiceCommand(event, selfServiceCommand);
+    return;
+  }
+
   const command = parseSecretaryCommand(text);
 
   if (!command) {
     return;
   }
 
+  const prefixedSelfServiceCommand = parseSelfServiceCommand(command.message);
+
+  if (prefixedSelfServiceCommand) {
+    handleSelfServiceCommand(event, prefixedSelfServiceCommand);
+    return;
+  }
+
   if (!isAuthorizedCommander(event.source.userId)) {
-    replyMessage(event.replyToken, [{ type: 'text', text: 'คำสั่งนี้ใช้ได้เฉพาะผู้ที่ได้รับสิทธิ์เท่านั้นครับ' }]);
+    replyMessage(event.replyToken, [
+      {
+        type: 'text',
+        text: [
+          'คำสั่งนี้ใช้ได้เฉพาะผู้ที่ได้รับสิทธิ์เท่านั้นครับ',
+          '',
+          `userId ที่บอทเห็น: ${event.source.userId || '-'}`,
+          'ให้นำค่านี้ไปใส่ใน Script property ชื่อ ADMIN_USER_IDS'
+        ].join('\n')
+      }
+    ]);
     return;
   }
 
@@ -94,33 +118,11 @@ function handleTextMessage(event) {
     return;
   }
 
-  const previewId = createPreviewId();
-  CacheService.getScriptCache().put(
-    previewId,
-    JSON.stringify({
-      type: command.type,
-      message: command.message,
-      groupId: event.source.groupId || event.source.roomId || '',
-      createdByUserId: event.source.userId
-    }),
-    600
-  );
-
-  replyMessage(event.replyToken, [buildConfirmationMessage(previewId, command)]);
+  createAndSendAnnouncement(event, command);
 }
 
 function handlePostback(event) {
   const data = parsePostbackData(event.postback.data);
-
-  if (data.action === 'confirm') {
-    confirmAnnouncement(event, data.previewId);
-    return;
-  }
-
-  if (data.action === 'cancel') {
-    replyMessage(event.replyToken, [{ type: 'text', text: 'ยกเลิกประกาศแล้วครับ' }]);
-    return;
-  }
 
   if (data.action === 'ack') {
     acknowledgeAnnouncement(event, data.announcementId);
@@ -156,80 +158,200 @@ function parseSecretaryCommand(text) {
   };
 }
 
-function buildConfirmationMessage(previewId, command) {
-  const title = command.type === 'urgent' ? 'ตรวจสอบประกาศด่วน' : 'ตรวจสอบประกาศ';
-  const deadlineText = command.type === 'urgent' ? '1 ชม.' : '3 ชม.';
+function parseSelfServiceCommand(text) {
+  const raw = String(text || '').trim();
+  const normalized = raw.toLowerCase();
 
-  return {
-    type: 'flex',
-    altText: title,
-    contents: {
-      type: 'bubble',
-      body: {
-        type: 'box',
-        layout: 'vertical',
-        spacing: 'md',
-        contents: [
-          { type: 'text', text: title, weight: 'bold', size: 'lg', wrap: true },
-          { type: 'text', text: command.message, wrap: true },
-          { type: 'text', text: `ต้องการส่งให้ครูรับทราบภายใน ${deadlineText} หรือไม่?`, size: 'sm', color: '#555555', wrap: true }
-        ]
-      },
-      footer: {
-        type: 'box',
-        layout: 'horizontal',
-        spacing: 'sm',
-        contents: [
-          {
-            type: 'button',
-            style: 'primary',
-            action: {
-              type: 'postback',
-              label: 'ยืนยันส่ง',
-              data: toPostbackData({ action: 'confirm', previewId })
-            }
-          },
-          {
-            type: 'button',
-            style: 'secondary',
-            action: {
-              type: 'postback',
-              label: 'ยกเลิก',
-              data: toPostbackData({ action: 'cancel' })
-            }
-          }
-        ]
+  if (['ช่วยเหลือ', 'help', 'วิธีใช้'].indexOf(normalized) >= 0) {
+    return { type: 'help' };
+  }
+
+  if (['id', 'userid', 'user id', 'groupid', 'group id', 'ไอดี', 'รหัส'].indexOf(normalized) >= 0) {
+    return { type: 'identity' };
+  }
+
+  const registerPrefixes = ['ลงทะเบียนผอ.', 'ลงทะเบียน ผอ.', 'ลงทะเบียน', 'สมัคร'];
+  const registerPrefix = registerPrefixes.find((prefix) => raw.startsWith(prefix));
+  if (registerPrefix) {
+    return {
+      type: 'register',
+      displayName: raw.slice(registerPrefix.length).trim()
+    };
+  }
+
+  return null;
+}
+
+function handleSelfServiceCommand(event, command) {
+  if (command.type === 'help') {
+    replyMessage(event.replyToken, [{ type: 'text', text: buildHelpText() }]);
+    return;
+  }
+
+  if (command.type === 'identity') {
+    replyMessage(event.replyToken, [{ type: 'text', text: buildIdentityText(event) }]);
+    return;
+  }
+
+  if (command.type === 'register') {
+    registerTeacher(event, command.displayName);
+  }
+}
+
+function buildHelpText() {
+  return [
+    'วิธีใช้ระบบเลขา',
+    '',
+    'คำสั่งที่พิมพ์ได้เลย:',
+    'ช่วยเหลือ',
+    'ไอดี หรือ id',
+    'ลงทะเบียน ครูชื่อ นามสกุล',
+    'สมัคร ครูชื่อ นามสกุล',
+    'ลงทะเบียน ผอ.ชื่อ นามสกุล',
+    '',
+    'ประกาศปกติสำหรับผู้มีสิทธิ์:',
+    '/เลขา ประกาศ ข้อความ',
+    '@เลขา ประกาศ ข้อความ',
+    'รับทราบภายใน 3 ชม.',
+    '',
+    'ประกาศด่วนสำหรับผู้มีสิทธิ์:',
+    '/ด่วน ข้อความ',
+    '@ด่วน ข้อความ',
+    'รับทราบภายใน 1 ชม.',
+    '',
+    'ตรวจ LINE ID:',
+    'ไอดี',
+    'id',
+    '/เลขา id',
+    '@เลขา ไอดี',
+    '',
+    'หมายเหตุ:',
+    'ผอ. และผู้มีสิทธิ์ประกาศควรลงทะเบียนด้วย',
+    'เพื่อให้ระบบแสดงชื่อถูกต้องเมื่อกดรับทราบ'
+  ].join('\n');
+}
+
+function buildIdentityText(event) {
+  return [
+    'ข้อมูล LINE ที่บอทเห็น',
+    `userId: ${event.source.userId || '-'}`,
+    `groupId: ${event.source.groupId || '-'}`,
+    `roomId: ${event.source.roomId || '-'}`,
+    '',
+    'ใช้ userId สำหรับตั้งสิทธิ์ผู้ประกาศ',
+    'ใช้ groupId สำหรับตรวจสอบกลุ่ม LINE'
+  ].join('\n');
+}
+
+function registerTeacher(event, displayName) {
+  if (!displayName) {
+    replyMessage(event.replyToken, [
+      {
+        type: 'text',
+        text: [
+          'กรุณาพิมพ์ชื่อหลังคำว่าลงทะเบียน',
+          'ตัวอย่าง:',
+          'ลงทะเบียน ครูสมชาย ใจดี'
+        ].join('\n')
       }
+    ]);
+    return;
+  }
+
+  const result = upsertTeacher(event.source.userId, displayName);
+  const roleText = getRoleForUser(event.source.userId) === 'director' ? 'ผอ./ผู้มีสิทธิ์ประกาศ' : 'ครู';
+  const actionText = result === 'updated' ? 'อัปเดตข้อมูลเรียบร้อยแล้วครับ' : 'ลงทะเบียนเรียบร้อยแล้วครับ';
+
+  replyMessage(event.replyToken, [
+    {
+      type: 'text',
+      text: [
+        actionText,
+        `ชื่อที่ใช้แสดง: ${displayName}`,
+        `ประเภทผู้ใช้: ${roleText}`,
+        `userId: ${event.source.userId}`
+      ].join('\n')
     }
-  };
+  ]);
+}
+
+function upsertTeacher(lineUserId, displayName) {
+  ensureDataStore();
+  const sheet = getSheet(CONFIG.SHEETS.TEACHERS);
+  const values = sheet.getDataRange().getValues();
+  const headers = values[0];
+  const teacherIdIndex = headers.indexOf('teacherId');
+  const displayNameIndex = headers.indexOf('displayName');
+  const lineUserIdIndex = headers.indexOf('lineUserId');
+  const roleIndex = headers.indexOf('role');
+  const activeIndex = headers.indexOf('active');
+
+  for (let row = 1; row < values.length; row += 1) {
+    if (values[row][lineUserIdIndex] === lineUserId) {
+      sheet.getRange(row + 1, displayNameIndex + 1).setValue(displayName);
+      sheet.getRange(row + 1, roleIndex + 1).setValue(getRoleForUser(lineUserId));
+      sheet.getRange(row + 1, activeIndex + 1).setValue(true);
+      return 'updated';
+    }
+  }
+
+  const nextRow = [];
+  nextRow[teacherIdIndex] = createId('T');
+  nextRow[displayNameIndex] = displayName;
+  nextRow[lineUserIdIndex] = lineUserId;
+  nextRow[roleIndex] = getRoleForUser(lineUserId);
+  nextRow[activeIndex] = true;
+  sheet.appendRow(nextRow);
+  return 'created';
+}
+
+function getRoleForUser(userId) {
+  return isAuthorizedCommander(userId) ? 'director' : 'teacher';
 }
 
 function buildAnnouncementMessage(announcementId, message, type, deadline) {
   const title = type === 'urgent' ? 'ประกาศด่วนจาก ผอ.' : 'ประกาศจาก ผอ.';
-  const deadlineText = Utilities.formatDate(deadline, CONFIG.TIMEZONE, 'dd/MM/yyyy HH:mm');
+  const noteText = type === 'urgent'
+    ? 'กรุณากดรับทราบภายใน 1 ชม.'
+    : 'กรุณากดรับทราบภายใน 3 ชม.';
 
   return {
     type: 'flex',
     altText: title,
     contents: {
       type: 'bubble',
+      size: 'mega',
       body: {
         type: 'box',
         layout: 'vertical',
+        backgroundColor: '#FFFFFF',
+        paddingAll: '18px',
         spacing: 'md',
         contents: [
-          { type: 'text', text: title, weight: 'bold', size: 'lg', wrap: true },
-          { type: 'text', text: message, wrap: true },
-          { type: 'text', text: `กรุณากดรับทราบภายใน ${deadlineText}`, size: 'sm', color: '#555555', wrap: true }
+          {
+            type: 'text',
+            text: title,
+            color: '#DC2626',
+            weight: 'bold',
+            size: 'lg',
+            align: 'center',
+            wrap: true
+          },
+          { type: 'text', text: message, color: '#111827', size: 'md', wrap: true }
         ]
       },
       footer: {
         type: 'box',
         layout: 'vertical',
+        backgroundColor: '#FFFFFF',
+        paddingAll: '16px',
+        spacing: 'sm',
         contents: [
+          { type: 'text', text: noteText, color: '#6B7280', size: 'xs', wrap: true },
           {
             type: 'button',
             style: 'primary',
+            color: '#16A34A',
             action: {
               type: 'postback',
               label: 'รับทราบ',
@@ -242,38 +364,30 @@ function buildAnnouncementMessage(announcementId, message, type, deadline) {
   };
 }
 
-function confirmAnnouncement(event, previewId) {
-  const rawPreview = CacheService.getScriptCache().get(previewId);
-  if (!rawPreview) {
-    replyMessage(event.replyToken, [{ type: 'text', text: 'รายการรอยืนยันหมดอายุแล้ว กรุณาสั่งประกาศใหม่ครับ' }]);
-    return;
-  }
-
-  const preview = JSON.parse(rawPreview);
-  if (!preview.groupId) {
+function createAndSendAnnouncement(event, command) {
+  const destinationId = event.source.groupId || event.source.roomId || '';
+  if (!destinationId) {
     replyMessage(event.replyToken, [{ type: 'text', text: 'กรุณาสั่งประกาศในกลุ่ม LINE ที่ต้องการส่งประกาศครับ' }]);
     return;
   }
 
-  const hours = preview.type === 'urgent' ? CONFIG.URGENT_DEADLINE_HOURS : CONFIG.NORMAL_DEADLINE_HOURS;
   const now = new Date();
-  const deadline = new Date(now.getTime() + hours * 60 * 60 * 1000);
+  const deadline = new Date(now.getTime() + command.deadlineHours * 60 * 60 * 1000);
   const announcementId = createId('ANN');
 
   appendRow(CONFIG.SHEETS.ANNOUNCEMENTS, [
     announcementId,
-    preview.type,
-    preview.message,
-    preview.groupId,
-    preview.createdByUserId,
+    command.type,
+    command.message,
+    destinationId,
+    event.source.userId,
     now,
     deadline,
     'open',
     ''
   ]);
 
-  replyMessage(event.replyToken, [{ type: 'text', text: 'รับทราบครับ กำลังส่งประกาศให้ครูทุกคน' }]);
-  pushMessage(preview.groupId, [buildAnnouncementMessage(announcementId, preview.message, preview.type, deadline)]);
+  replyMessage(event.replyToken, [buildAnnouncementMessage(announcementId, command.message, command.type, deadline)]);
 }
 
 function acknowledgeAnnouncement(event, announcementId) {
@@ -289,8 +403,67 @@ function acknowledgeAnnouncement(event, announcementId) {
   const ackAt = new Date();
   appendRow(CONFIG.SHEETS.ACKS, [createId('ACK'), announcementId, userId, teacherName, ackAt]);
 
-  const timeText = Utilities.formatDate(ackAt, CONFIG.TIMEZONE, 'dd/MM/yyyy HH:mm');
-  replyMessage(event.replyToken, [{ type: 'text', text: `${teacherName} รับทราบแล้ว\nเวลา ${timeText}` }]);
+  const timeText = formatThaiDateTime(ackAt);
+  replyMessage(event.replyToken, [buildAckMessage(teacherName, timeText)]);
+}
+
+function buildAckMessage(teacherName, timeText) {
+  return {
+    type: 'flex',
+    altText: `${teacherName} รับทราบแล้ว`,
+    contents: {
+      type: 'bubble',
+      size: 'kilo',
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        backgroundColor: '#FFFFFF',
+        paddingAll: '16px',
+        spacing: 'sm',
+        contents: [
+          {
+            type: 'text',
+            text: `${teacherName} รับทราบแล้ว`,
+            color: '#111827',
+            weight: 'bold',
+            size: 'md',
+            wrap: true
+          },
+          {
+            type: 'text',
+            text: timeText,
+            color: '#4B5563',
+            size: 'sm',
+            wrap: true
+          }
+        ]
+      }
+    }
+  };
+}
+
+function formatThaiDateTime(date) {
+  const monthNames = [
+    'ม.ค.',
+    'ก.พ.',
+    'มี.ค.',
+    'เม.ย.',
+    'พ.ค.',
+    'มิ.ย.',
+    'ก.ค.',
+    'ส.ค.',
+    'ก.ย.',
+    'ต.ค.',
+    'พ.ย.',
+    'ธ.ค.'
+  ];
+  const day = Number(Utilities.formatDate(date, CONFIG.TIMEZONE, 'd'));
+  const month = Number(Utilities.formatDate(date, CONFIG.TIMEZONE, 'M'));
+  const buddhistYear = Number(Utilities.formatDate(date, CONFIG.TIMEZONE, 'yyyy')) + 543;
+  const shortYear = String(buddhistYear).slice(-2);
+  const time = Utilities.formatDate(date, CONFIG.TIMEZONE, 'HH.mm');
+
+  return `${day} ${monthNames[month - 1]} ${shortYear} เวลา ${time} น.`;
 }
 
 function checkDeadlines() {
@@ -378,7 +551,7 @@ function callLineApi(url, payload) {
 
 function isAuthorizedCommander(userId) {
   const adminIds = (getProperty('ADMIN_USER_IDS') || '')
-    .split(',')
+    .split(/[,，\s]+/)
     .map((value) => value.trim())
     .filter(Boolean);
 
@@ -392,7 +565,11 @@ function getTeacherName(userId) {
 }
 
 function getActiveTeachers() {
-  return getRows(CONFIG.SHEETS.TEACHERS).filter((row) => String(row.active).toLowerCase() !== 'false');
+  return getRows(CONFIG.SHEETS.TEACHERS).filter((row) => {
+    const active = String(row.active).toLowerCase() !== 'false';
+    const role = String(row.role || 'teacher').toLowerCase();
+    return active && role === 'teacher';
+  });
 }
 
 function findAck(announcementId, userId) {
@@ -498,10 +675,6 @@ function toPostbackData(data) {
   return Object.keys(data)
     .map((key) => `${encodeURIComponent(key)}=${encodeURIComponent(data[key])}`)
     .join('&');
-}
-
-function createPreviewId() {
-  return createId('PREVIEW');
 }
 
 function createId(prefix) {
