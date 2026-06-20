@@ -1,0 +1,9 @@
+{
+  "name": "gas-line-secretary",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Google Apps Script LINE acknowledgement secretary bot.",
+  "scripts": {
+    "check": "node scripts/check-source.mjs"
+  }
+}
