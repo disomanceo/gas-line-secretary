@@ -12,6 +12,7 @@ const CONFIG = {
   URGENT_PREFIXES: ['@ด่วน', '/ด่วน'],
   NORMAL_DEADLINE_HOURS: 3,
   URGENT_DEADLINE_HOURS: 1,
+  REMINDER_BEFORE_MINUTES: 5,
   TIMEZONE: 'Asia/Bangkok'
 };
 
@@ -52,6 +53,7 @@ function ensureDataStore() {
     'createdAt',
     'deadlineAt',
     'status',
+    'reminderSentAt',
     'summarySentAt'
   ]);
   ensureSheet(ss, CONFIG.SHEETS.ACKS, [
@@ -59,7 +61,8 @@ function ensureDataStore() {
     'announcementId',
     'lineUserId',
     'displayName',
-    'ackAt'
+    'ackAt',
+    'ackStatus'
   ]);
   ensureSheet(ss, CONFIG.SHEETS.SETTINGS, ['key', 'value']);
   return ss;
@@ -375,17 +378,18 @@ function createAndSendAnnouncement(event, command) {
   const deadline = new Date(now.getTime() + command.deadlineHours * 60 * 60 * 1000);
   const announcementId = createId('ANN');
 
-  appendRow(CONFIG.SHEETS.ANNOUNCEMENTS, [
+  appendRecord(CONFIG.SHEETS.ANNOUNCEMENTS, {
     announcementId,
-    command.type,
-    command.message,
-    destinationId,
-    event.source.userId,
-    now,
-    deadline,
-    'open',
-    ''
-  ]);
+    type: command.type,
+    message: command.message,
+    groupId: destinationId,
+    createdByUserId: event.source.userId,
+    createdAt: now,
+    deadlineAt: deadline,
+    status: 'open',
+    reminderSentAt: '',
+    summarySentAt: ''
+  });
 
   replyMessage(event.replyToken, [buildAnnouncementMessage(announcementId, command.message, command.type, deadline)]);
 }
@@ -394,23 +398,35 @@ function acknowledgeAnnouncement(event, announcementId) {
   const userId = event.source.userId;
   const teacherName = getTeacherName(userId) || 'ครู';
   const existing = findAck(announcementId, userId);
+  const announcement = getAnnouncementById(announcementId);
 
   if (existing) {
-    replyMessage(event.replyToken, [{ type: 'text', text: `${teacherName} รับทราบไว้แล้วครับ` }]);
     return;
   }
 
   const ackAt = new Date();
-  appendRow(CONFIG.SHEETS.ACKS, [createId('ACK'), announcementId, userId, teacherName, ackAt]);
+  const ackStatus = announcement && new Date(announcement.deadlineAt).getTime() < ackAt.getTime() ? 'late' : 'on_time';
+  appendRecord(CONFIG.SHEETS.ACKS, {
+    ackId: createId('ACK'),
+    announcementId,
+    lineUserId: userId,
+    displayName: teacherName,
+    ackAt,
+    ackStatus
+  });
 
   const timeText = formatThaiDateTime(ackAt);
-  replyMessage(event.replyToken, [buildAckMessage(teacherName, timeText)]);
+  replyMessage(event.replyToken, [buildAckMessage(teacherName, timeText, ackStatus)]);
 }
 
-function buildAckMessage(teacherName, timeText) {
+function buildAckMessage(teacherName, timeText, ackStatus) {
+  const title = ackStatus === 'late'
+    ? `${teacherName} รับทราบแล้วหลังครบกำหนด`
+    : `${teacherName} รับทราบแล้ว`;
+
   return {
     type: 'flex',
-    altText: `${teacherName} รับทราบแล้ว`,
+    altText: title,
     contents: {
       type: 'bubble',
       size: 'kilo',
@@ -423,7 +439,7 @@ function buildAckMessage(teacherName, timeText) {
         contents: [
           {
             type: 'text',
-            text: `${teacherName} รับทราบแล้ว`,
+            text: title,
             color: '#111827',
             weight: 'bold',
             size: 'md',
@@ -477,39 +493,126 @@ function checkDeadlines() {
     }
 
     const deadline = new Date(row.deadlineAt);
-    if (deadline.getTime() > now.getTime()) {
+    const millisecondsLeft = deadline.getTime() - now.getTime();
+    const status = buildAnnouncementStatus(row);
+
+    if (millisecondsLeft > 0) {
+      const reminderWindow = CONFIG.REMINDER_BEFORE_MINUTES * 60 * 1000;
+      if (!row.reminderSentAt && millisecondsLeft <= reminderWindow && status.missing.length > 0) {
+        pushMessage(row.groupId, [buildReminderMessage(row, status)]);
+        updateAnnouncementReminderSent(row.announcementId, now);
+      }
       return;
     }
 
-    const summary = buildDeadlineSummary(row);
-    pushMessage(row.groupId, [{ type: 'text', text: summary }]);
+    pushMessage(row.groupId, [buildDeadlineSummaryMessage(row, status)]);
     updateAnnouncementSummarySent(row.announcementId, now);
   });
 }
 
-function buildDeadlineSummary(announcement) {
+function buildAnnouncementStatus(announcement) {
   const teachers = getActiveTeachers();
-  const ackedUserIds = getAckedUserIds(announcement.announcementId);
-  const missing = teachers.filter((teacher) => !ackedUserIds[teacher.lineUserId]);
+  const ackRecords = getAckRecordsByAnnouncement(announcement.announcementId);
+  const ackedByUserId = ackRecords.reduce((result, ack) => {
+    result[ack.lineUserId] = ack;
+    return result;
+  }, {});
+  const missing = teachers.filter((teacher) => !ackedByUserId[teacher.lineUserId]);
+  const onTime = teachers.filter((teacher) => ackedByUserId[teacher.lineUserId]?.ackStatus !== 'late' && ackedByUserId[teacher.lineUserId]);
+  const late = teachers.filter((teacher) => ackedByUserId[teacher.lineUserId]?.ackStatus === 'late');
 
-  if (missing.length === 0) {
-    return `สรุปการรับทราบประกาศ\n${announcement.message}\n\nครูทุกคนรับทราบแล้วครับ`;
+  return { teachers, missing, onTime, late };
+}
+
+function buildReminderMessage(announcement, status) {
+  const names = formatNameList(status.missing);
+
+  return buildStatusFlexMessage({
+    title: 'แจ้งเตือนก่อนครบกำหนด',
+    titleColor: '#D97706',
+    message: announcement.message,
+    lines: [
+      `เหลืออีกประมาณ ${CONFIG.REMINDER_BEFORE_MINUTES} นาที`,
+      'ครูที่ยังไม่รับทราบ กรุณากดรับทราบด้วยครับ',
+      '',
+      `ยังไม่รับทราบ ${status.missing.length} คน`,
+      names
+    ]
+  });
+}
+
+function buildDeadlineSummaryMessage(announcement, status) {
+  return buildStatusFlexMessage({
+    title: 'ครบกำหนดรับทราบแล้ว',
+    titleColor: '#DC2626',
+    message: announcement.message,
+    lines: [
+      `รับทราบตรงเวลา ${status.onTime.length} คน`,
+      `รับทราบล่าช้า ${status.late.length} คน`,
+      `ยังไม่รับทราบ ${status.missing.length} คน`,
+      '',
+      status.missing.length > 0 ? 'รายชื่อที่ยังไม่รับทราบ:' : 'ครูทุกคนรับทราบแล้วครับ',
+      status.missing.length > 0 ? formatNameList(status.missing) : ''
+    ]
+  });
+}
+
+function buildStatusFlexMessage(options) {
+  return {
+    type: 'flex',
+    altText: options.title,
+    contents: {
+      type: 'bubble',
+      size: 'mega',
+      body: {
+        type: 'box',
+        layout: 'vertical',
+        backgroundColor: '#FFFFFF',
+        paddingAll: '18px',
+        spacing: 'md',
+        contents: [
+          {
+            type: 'text',
+            text: options.title,
+            color: options.titleColor,
+            weight: 'bold',
+            size: 'lg',
+            align: 'center',
+            wrap: true
+          },
+          { type: 'text', text: options.message, color: '#111827', size: 'md', wrap: true },
+          {
+            type: 'text',
+            text: options.lines.filter(Boolean).join('\n'),
+            color: '#374151',
+            size: 'sm',
+            wrap: true
+          }
+        ]
+      }
+    }
+  };
+}
+
+function formatNameList(teachers) {
+  if (teachers.length === 0) {
+    return '';
   }
 
-  return [
-    'สรุปการรับทราบประกาศ',
-    announcement.message,
-    '',
-    `รับทราบแล้ว ${teachers.length - missing.length} คน`,
-    `ยังไม่รับทราบ ${missing.length} คน:`,
-    missing.map((teacher) => teacher.displayName).join(', ')
-  ].join('\n');
+  const visibleNames = teachers.slice(0, 15).map((teacher) => teacher.displayName);
+  const hiddenCount = teachers.length - visibleNames.length;
+  const suffix = hiddenCount > 0 ? `\nและอีก ${hiddenCount} คน` : '';
+  return `${visibleNames.join('\n')}${suffix}`;
 }
 
 function installDeadlineTrigger() {
+  ScriptApp.getProjectTriggers()
+    .filter((trigger) => trigger.getHandlerFunction() === 'checkDeadlines')
+    .forEach((trigger) => ScriptApp.deleteTrigger(trigger));
+
   ScriptApp.newTrigger('checkDeadlines')
     .timeBased()
-    .everyMinutes(10)
+    .everyMinutes(5)
     .create();
 }
 
@@ -578,27 +681,36 @@ function findAck(announcementId, userId) {
   );
 }
 
-function getAckedUserIds(announcementId) {
-  return getRows(CONFIG.SHEETS.ACKS)
-    .filter((row) => row.announcementId === announcementId)
-    .reduce((result, row) => {
-      result[row.lineUserId] = true;
-      return result;
-    }, {});
+function getAnnouncementById(announcementId) {
+  return getRows(CONFIG.SHEETS.ANNOUNCEMENTS).find((row) => row.announcementId === announcementId);
+}
+
+function getAckRecordsByAnnouncement(announcementId) {
+  return getRows(CONFIG.SHEETS.ACKS).filter((row) => row.announcementId === announcementId);
+}
+
+function updateAnnouncementReminderSent(announcementId, reminderSentAt) {
+  updateAnnouncementFields(announcementId, { reminderSentAt });
 }
 
 function updateAnnouncementSummarySent(announcementId, summarySentAt) {
+  updateAnnouncementFields(announcementId, { status: 'closed', summarySentAt });
+}
+
+function updateAnnouncementFields(announcementId, fields) {
   const sheet = getSheet(CONFIG.SHEETS.ANNOUNCEMENTS);
   const values = sheet.getDataRange().getValues();
   const headers = values[0];
   const idIndex = headers.indexOf('announcementId');
-  const statusIndex = headers.indexOf('status');
-  const summaryIndex = headers.indexOf('summarySentAt');
 
   for (let row = 1; row < values.length; row += 1) {
     if (values[row][idIndex] === announcementId) {
-      sheet.getRange(row + 1, statusIndex + 1).setValue('closed');
-      sheet.getRange(row + 1, summaryIndex + 1).setValue(summarySentAt);
+      Object.keys(fields).forEach((fieldName) => {
+        const fieldIndex = headers.indexOf(fieldName);
+        if (fieldIndex >= 0) {
+          sheet.getRange(row + 1, fieldIndex + 1).setValue(fields[fieldName]);
+        }
+      });
       return;
     }
   }
@@ -621,20 +733,31 @@ function getRows(sheetName) {
   });
 }
 
-function appendRow(sheetName, values) {
-  getSheet(sheetName).appendRow(values);
+function appendRecord(sheetName, record) {
+  const sheet = getSheet(sheetName);
+  const headers = sheet.getDataRange().getValues()[0];
+  const row = headers.map((header) => Object.prototype.hasOwnProperty.call(record, header) ? record[header] : '');
+  sheet.appendRow(row);
 }
 
 function ensureSheet(ss, name, headers) {
   const sheet = ss.getSheetByName(name) || ss.insertSheet(name);
-  const firstRow = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
-  const hasHeaders = headers.every((header, index) => firstRow[index] === header);
+  const lastColumn = Math.max(sheet.getLastColumn(), headers.length);
+  const firstRow = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+  const existingHeaders = firstRow.map((header) => String(header || '').trim()).filter(Boolean);
 
-  if (!hasHeaders) {
-    sheet.clear();
+  if (existingHeaders.length === 0) {
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
     sheet.setFrozenRows(1);
+    return;
   }
+
+  const missingHeaders = headers.filter((header) => existingHeaders.indexOf(header) < 0);
+  if (missingHeaders.length > 0) {
+    sheet.getRange(1, existingHeaders.length + 1, 1, missingHeaders.length).setValues([missingHeaders]);
+  }
+
+  sheet.setFrozenRows(1);
 }
 
 function getSheet(sheetName) {
